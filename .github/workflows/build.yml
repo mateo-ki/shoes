@@ -47,12 +47,14 @@ jobs:
             use_cross: false
             binary_name: shoes
 
-          # Windows builds
-          # TODO: enable when working
-          # - target: x86_64-pc-windows-msvc
-          #   os: windows-latest
-          #   use_cross: false
-          #   binary_name: shoes.exe
+          # Windows x64 build (verified: builds and runs on x86_64-pc-windows-msvc)
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            binary_name: shoes.exe
+          # aarch64-pc-windows-msvc: keep disabled until a release-blocking
+          # failure is ruled out; the release job requires every matrix leg
+          # to succeed, and ARM64 MSVC cross-linking is unverified.
           # - target: aarch64-pc-windows-msvc
           #   os: windows-latest
           #   use_cross: false
@@ -159,8 +161,12 @@ jobs:
         run: |
           mkdir -p artifacts
           cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "artifacts/${{ matrix.binary_name }}"
+
+          # Keep dependency notices alongside the binary, matching the Unix artifacts
+          cp THIRD_PARTY_NOTICES.md artifacts/
+          cp -R licenses artifacts/
           cd artifacts
-          7z a ${{ github.event.repository.name }}-${{ matrix.target }}.zip "${{ matrix.binary_name }}"
+          7z a ${{ github.event.repository.name }}-${{ matrix.target }}.zip "${{ matrix.binary_name }}" THIRD_PARTY_NOTICES.md licenses
 
       - name: Verify artifacts before upload
         run: |
