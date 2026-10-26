@@ -788,6 +788,8 @@ async fn relay_tcp_stream(
         Ok(routed.setup)
     }
     .await;
+    drop(client_proxy_selector);
+    drop(resolver);
     let Some(mut client_stream) = finish_tcp_setup(&mut server_stream, setup, success_sent)
         .await
         .map_err(|error| {
@@ -881,7 +883,7 @@ async fn read_varint(
 
 pub async fn start_hysteria2_server(
     bind_address: SocketAddr,
-    quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
+    quic_server_config: Arc<dyn quinn::crypto::ServerConfig>,
     hysteria2_password: Arc<str>,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,

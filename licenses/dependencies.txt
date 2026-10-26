@@ -2278,6 +2278,8 @@ Repository: https://github.com/daxpedda/web-time
 
 
 License: Apache License 2.0 (Apache-2.0)
+Package: instant-acme 0.8.5
+Repository: https://github.com/djc/instant-acme
 Package: quinn-proto 0.11.19
 Repository: https://github.com/quinn-rs/quinn
 Package: quinn-udp 0.5.16
@@ -11131,7 +11133,7 @@ SOFTWARE.
 License: MIT License (MIT)
 Package: tokio-util 0.7.20
 Repository: https://github.com/tokio-rs/tokio
-Package: tokio 1.54.0
+Package: tokio 1.54.1
 Repository: https://github.com/tokio-rs/tokio
 
 MIT License

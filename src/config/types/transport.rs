@@ -54,6 +54,7 @@ impl Transport {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpConfig {
     #[serde(default = "default_true")]
     pub no_delay: bool,
@@ -67,12 +68,18 @@ impl Default for TcpConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerQuicConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_source: Option<String>,
+    #[serde(skip)]
+    pub certificate_binding: Option<std::sync::Arc<crate::certificates::Source>>,
     #[serde(
         default,
         skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
     )]
     pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
+    #[serde(default)]
     pub cert: String,
+    #[serde(default)]
     pub key: String,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
