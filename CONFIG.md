@@ -10,10 +10,12 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [WireGuard](#wireguard)
 - [Client Config](#client-config)
 - [Client Protocols](#client-protocols)
+- [Native DNS Freshness](#native-dns-freshness)
 - [Fake DNS](#fake-dns)
 - [Rules System](#rules-system)
 - [Named Groups](#named-groups)
 - [Named PEMs](#named-pems)
+- [Certificate Sources](#certificate-sources)
 - [Advanced Features](#advanced-features)
 - [Command Line](#command-line)
 
@@ -247,11 +249,12 @@ throughput, and available memory rather than increasing buffers unconditionally.
 Periodic logs report endpoint flow/drop counts and each peer's public key,
 handshake age, and byte counters. Private keys and PSKs are redacted.
 
-Preparation failures retain the old configuration. Successful reloads
-disconnect existing tunnel flows and rebuild endpoints; sessions are not
-migrated. Bind failures during activation can still terminate the process
-after the old generation has stopped. Shutdown waits for buffered UDP tasks
-to release their sockets before rebind. No host route cleanup is necessary.
+Preparation failures retain the old configuration. Reload activation stops
+existing tunnel flows and rebuilds endpoints; sessions are not migrated.
+Bind failures during activation trigger rollback to the previous configuration,
+but disconnected tunnel sessions are not restored. If rollback fails, Shoes
+exits with status 1. Shutdown waits for buffered UDP tasks to release their
+sockets before rebind. No host route cleanup is necessary.
 
 ## Configuration Structure
 
@@ -285,6 +288,111 @@ A configuration file is a YAML array containing one or more configuration entrie
 - pem: my-cert
   path: /path/to/cert.pem
 ```
+
+## Ordered Healthy Fallback
+
+The CLI supports opt-in ordered fallback without a Clash API listener:
+
+```yaml
+- client_group: outbound
+  type: fallback
+  health_check:
+    url: "https://probe.example.com/generate_204"
+    interval_secs: 30
+    timeout_ms: 5000
+    expected_status: 204
+  client_proxies:
+    - name: primary
+      address: "primary.example.com:1080"
+      protocol: {type: socks}
+    - name: backup
+      address: "backup.example.com:1080"
+      protocol: {type: socks}
+```
+
+Rules use `client_chain: outbound`. `health_check` is required only for fallback
+and rejected on other group types. The removed `strategy` field is not accepted.
+The URL must be HTTP(S), at most 2048 bytes,
+without credentials or fragments. `interval_secs` is required, 1..86400;
+`timeout_ms` defaults to 5000, 1..32767; `expected_status` defaults to 204,
+100..599. Unknown fields, empty groups, duplicate immediate members and
+selector-only `default` are rejected. Anonymous inline members are supported.
+
+For each new flow, explicit nested selector choices and final-hop UDP capability
+are applied first. Fallback chooses the first member with a healthy eligible
+concrete path. If none is healthy, never-sampled paths may be tried in order.
+Failed and stale paths are excluded; all-down returns an error, never implicit
+DIRECT. A sample becomes stale after three intervals plus the probe timeout.
+Probes skip paths excluded by manual selector choices, rechecking those choices
+after admission. Reselecting a skipped path schedules a check without waiting
+another interval, still subject to shared admission and transport deadlines.
+Previously sampled paths that became stale while unselected remain excluded
+until a new check succeeds; reselection does not make an old sample Unknown.
+New flows can therefore fail closed while rechecks are pending or locally blocked.
+Manual choices are never rewritten or persisted by health checking.
+Resolver-chain selector changes trigger rechecks without erasing
+existing samples: DNS caches and retained connections are not concrete-path
+identity. Relevant selector changes fence in-flight probe results, including
+A-to-B-to-A changes; unrelated selectors and inactive nested branches do not.
+Fixed outer path choices do not erase samples. DNS-chain checks use the same
+configured bootstrap resolver as forwarding.
+A fallback-checked chain cannot contain WireGuard whose `peer_client_chain` has
+more than one member at any hop, including recursively nested WireGuard carriers.
+All configured alternatives count, even branches that cannot carry UDP. It also
+cannot contain NaiveProxy (including wrapped NaiveProxy) after a hop with multiple
+members: its retained H2 session is not scoped to the selected prefix. These
+combinations are rejected, not probed approximately. Fixed WireGuard carriers,
+NaiveProxy at hop 0 or behind a single fixed prefix, and ordinary chains without
+fallback remain supported. The restrictions also cover DNS chains and unused
+groups available to controller/URL-test probes; resolver-only dependencies do
+not count as the fallback chain's transport path.
+A fallback containing a selector may choose its next member, but
+never another branch inside
+that selector. Fallback member and healthy-before-unknown priorities are resolved
+across complete eligible paths before URL-test latency and round-robin pool
+choices. Paths outside each fallback branch remain eligible, so an unrelated
+round-robin branch is not globally overridden by health.
+
+Checks send HEAD through the complete configured TCP chain, require the expected
+status, verify HTTPS certificates, and do not follow redirects. They share the
+controller and URL-test probe engine and its 16 concurrent permits. The total deadline includes
+admission, DNS, connect, TLS and response headers. Admission exhaustion or local
+resource shortages do not mark a path failed; expiry after queued admission
+preserves the previous sample without refreshing its timestamp. Successful and failed checks both
+wait the configured interval, jittered by +/-10%, before retrying. Unused groups
+do not start transports; checks start when a runtime chain is instantiated.
+Controller delay requests and URL-test targets can instantiate additional fallback
+chains. Their checks last while the cached probe connector lives (normally the
+generation) and obey that target's selectors, not selectors enclosing it in
+routing rules. They share the same check and concurrency limits.
+
+Health is generation-local and keyed by canonical full-path configuration, resolver
+identity, selector constraints and probe settings, not names or member positions.
+Equivalent checks share one sample; different prefixes/endpoints do not. Each
+chain is limited to 256 concrete paths and each generation to 1024 active checks. Large pool products are
+rejected instead of spawning unbounded probes. Due checks are admitted oldest-first
+so repeated checks cannot indefinitely overtake waiting paths. Saturation can make samples stale;
+choose intervals/timeouts that fit the shared budget. Reload cancels and joins old
+checks before starting the new generation. Draining sessions keep the old
+generation's health snapshot at cancellation, without further probes or aging;
+rollback/resume restores normal freshness checks. Samples are not persisted.
+Pause time counts toward sample age after resume, so a long rejected activation
+can require successful rechecks before the resumed fallback accepts new flows.
+
+Checks use the existing probe destination restrictions (including loopback,
+link-local and synthetic Fake-IP protection). Forbidden literal URLs, including
+configured or retained Fake-IP ranges, are rejected during validation.
+Proxy-side DNS remains subject to
+the remote proxy's policy. A TCP sample does not prove UDP reachability, nor does
+one probe endpoint measure all destinations. Application errors never update
+health, and application bytes are never replayed. Existing TCP streams, UDP
+associations and pooled transports keep their selected member until reopened.
+There is no latency scoring, passive cooldown, hysteresis, affinity, or all-down
+last-resort mode. FFI rejects fallback because it does not own this scheduler.
+
+Controller delay history remains separate from fallback samples. `Fallback`
+catalog entries expose members and capabilities; there is no single global `now`
+member because selection depends on the concrete chain and transport.
 
 ## Clash Controller
 
@@ -327,7 +435,7 @@ Opt into manual selection explicitly:
 
 ```yaml
 - client_group: outbound
-  strategy: selector
+  type: selector
   default: east
   client_proxies:
     - name: east
@@ -340,13 +448,101 @@ Opt into manual selection explicitly:
 
 Rules continue to use `client_chain: outbound`. A selector chooses an immediate
 named member or referenced group; inline selector members require `name`.
-Other groups default to `strategy: round-robin`. Nested round-robin weights,
+The group discriminant is `type`: `round-robin` (the default), `selector`,
+`url-test`, or `fallback`. The removed `strategy` field and unknown types are errors. Nested round-robin weights,
 duplicate membership, and existing UDP filtering are preserved. A selected
 branch without UDP support fails new UDP flows instead of silently falling back.
 Selection changes affect new flows only; existing streams, UDP destinations,
 DNS connections, and WireGuard associations remain pinned until reopened.
 Optional client and server/TUN `name` fields provide stable dashboard identities.
 Generated anonymous names are stable only for unchanged definition sites.
+
+Automatic selection does not require a controller listener or a cache file:
+
+```yaml
+- client_group: fastest
+  type: url-test
+  url: "https://probe.example.com/generate_204"
+  interval: 300       # seconds, 1..86400
+  timeout: 5000       # milliseconds, 1..60000, no longer than interval
+  tolerance: 50       # milliseconds, 0..65535
+  lazy: true
+  client_proxies:
+    - name: east
+      address: "east.example.com:1080"
+      protocol: {type: socks}
+    - name: west
+      address: "west.example.com:1080"
+      protocol: {type: socks}
+```
+
+Only `url` is required for `url-test`; the values above are the other defaults.
+Literal URL addresses denied by probe policy (including loopback, link-local,
+multicast, unspecified, and synthetic benchmark addresses) are configuration errors.
+Locally resolved hostnames are subject to the same destination policy at probe time.
+Literal URLs overlapping configured or retained fake-IP ranges are also rejected.
+`default` is selector-only. `url`, `interval`, `timeout`, `tolerance`, and `lazy`
+are url-test-only. Members must be nonempty and distinct; references to nested
+groups are supported. Explicit names are recommended for automatic inline members.
+
+Selection uses the fastest fresh healthy result for the configured URL, among
+members eligible for that hop and transport. A healthy incumbent stays selected
+unless another member improves its delay by more than `tolerance`. TCP and UDP
+have separate incumbents; an automatic group can choose a UDP-capable alternative
+even when its fastest TCP member does not support UDP. Nested manual selectors
+still restrict eligibility, and intermediate chain hops only need TCP support.
+Changing selection affects new connections, not established streams or associations.
+
+There is one initial check after activation, including for lazy groups. Thereafter
+`lazy: true` checks only groups used by new forwarding connections during the last
+interval. Probes, dashboard reads, and WireGuard carrier maintenance never count as use.
+New outbound connections through a WireGuard endpoint wake its carrier groups,
+including nested carriers, without changing their existing associations. Inbound-only
+endpoints and long-lived flows need `lazy: false` for continuous checks. `lazy: false` checks idle
+groups too. Samples older than `2 * interval + timeout` are stale and cannot win
+on delay. Without fresh healthy results (startup, all dead, stale, or locally
+unavailable probes), retain the eligible incumbent, or choose the first eligible
+member in configuration order. This is best-effort routing, not fail-closed routing.
+
+Unambiguous remote connection errors request a rate-limited recheck (at most once
+per second); they do not mark the configured URL dead based on a different user
+destination. Local overload and unsupported operations do not penalize health.
+HTTP/2 adapters preserve matching transport-error causes for this classification.
+This is best effort when a protocol replaces a failure with a generic cancellation:
+for example, XHTTP upload cancellation can lose the original cause and count as a
+remote failure.
+User payloads are never retried across candidates. Probes use HTTP HEAD and accept
+any HTTP response status, without redirects; HTTPS certificates are verified.
+Local probe lookups use guarded system DNS, not a server's configured DNS group.
+API probes with the same normalized URL and wildcard/default expected status also
+update selection. Other URLs and explicit status expectations cannot overwrite it.
+
+Periodic and API probes share a 16-probe limit. Each periodic round's timeout
+includes admission/queue time; members not admitted before the deadline retain
+their previous health. A deadline expiry after queueing is inconclusive and also
+preserves prior health; successful probes and explicit remote errors still update it.
+Members with no full-budget attempt, then the oldest full-budget attempts, lead each
+round, independently of health. Local failures cannot monopolize these slots, and
+queued attempts can receive a full budget on a later round. Tied members rotate on admission.
+Due groups with the oldest unqueued admission get priority, with stable catalog order
+breaking ties.
+Under sustained saturation, reduce group size, increase
+timeout/interval, or expect unprobed/stale members. Scheduling has one-second
+granularity and does not overlap rounds within a group; other groups can run while
+a slow round is in flight. Activation/reload cancels old work and rejects obsolete
+results; an interrupted round is immediately eligible when its generation resumes.
+New committed generations start with unprobed health.
+
+The controller reports `type: URLTest`, effective TCP `now`, optional `udpNow`,
+`testUrl`, and selected-member `health` (`unprobed`, `healthy`, `dead`, or `stale`).
+Its `alive` is true only for fresh healthy results. Manual selection PUTs for
+automatic groups are rejected; automatic choices are neither pinned nor persisted.
+Leaf histories remain bounded to ten samples per URL and eight URLs. Automatic
+selection retains its configured-URL samples and full-budget attempt timestamps
+independently of API eviction; other attempt URLs are capped at eight per member
+for each of filtered and unfiltered probes.
+Automatic checks test each immediate member as a standalone outbound, not every
+surrounding chain or destination. URL-test groups are not supported by FFI.
 
 Only one `cache_file_path` is allowed across all input files. Its absence disables
 persistence; relative paths resolve against the process working directory.
@@ -368,6 +564,36 @@ DNS/carrier traffic, and unauthenticated camouflage/fallback forwarding are excl
 synthetic fake-DNS answers and ICMP are not represented as connections.
 Connection speeds are derived by the dashboard from successive byte counters.
 Process/GeoIP data is not fabricated.
+
+Optional `connection_notes: true` on a Clash API entry (`clash_api_address` or
+`clash_api_path`) adds setup notes to active `/connections` objects, over HTTP and
+WebSocket. It defaults to false; changing it requires a restart.
+If any controller enables it, all controllers expose notes. In zashboard, open a
+connection's details and select **Raw** to inspect `notes` (`elapsedUs`, `phase`,
+`text`), alongside its existing generation, destination, selected chain, and rule
+metadata.
+
+Notes describe preparation, routing choices, inbound-resolver calls, and outbound
+setup. They are best-effort: rejected/failed setup and closed connections have no
+retained history or separate debug endpoint. A dashboard may retain previously
+sampled connections, but short-lived connections can be missed. DNS notes cover
+existing routing/dial call boundaries, not resolver cache/upstream internals or
+remote DNS. Initial UDP prechecks and local-DNS handling are not observed.
+Notes contain hostnames and addresses, never payloads, credentials, or error
+messages; errors use only their kind.
+They may reveal outbound proxy server hostnames and IP addresses not otherwise
+exposed by the API.
+
+At most 256 connections (including pending setup) collect notes at once. Each
+buffer holds 32 events with at most 128 UTF-8 bytes of text each, plus an overflow
+summary when read. New connections skip notes while all slots are occupied.
+Buffers reserve at most 8 KiB each, 2 MiB in aggregate, excluding allocator/RSS
+overhead and snapshot copies/JSON. Closing or abandoning a connection releases
+its buffer when its last reader finishes. The budget is shared across reloads.
+With notes disabled, no note buffers or resolver wrappers are allocated.
+When enabled, notes add setup work and snapshot copying/serialization: the
+controller samples every second even without subscribers; HTTP requests and
+custom-interval WebSocket subscriptions can request additional snapshots.
 
 Delay tests send HTTP HEAD through actual outbounds, verify HTTPS certificates,
 and never follow redirects. A leaf test is standalone, not a test of every chain
@@ -393,7 +619,7 @@ are exempt from header idle expiry and have bounded queues/write deadlines.
 Responses are limited to 32 MiB. An oversized connection snapshot closes its
 WebSocket with code 1009 and reason `response exceeds 32 MiB`; tracking continues
 without truncating the connection list.
-Configuring a controller, `cache_file_path`, or any selector group enables the
+Configuring a controller, `cache_file_path`, or any selector/url-test/fallback group enables the
 catalog and its 16,384-node limit. Names must be nonempty, unique, at most 256
 bytes, and contain no control characters. `DIRECT`, `REJECT`, and
 `GLOBAL` are reserved. Configuration preparation rejects `/rules` or base
@@ -798,6 +1024,23 @@ protocol:
   password: string
 ```
 
+For `2022-blake3-aes-128-gcm` and `2022-blake3-aes-256-gcm`, a client can connect
+to a multi-user server using `password: "server-key:user-key"`. Each component is
+independently base64-encoded and must decode to 16 bytes for AES-128 or 32 bytes
+for AES-256. For identity relays, use
+`password: "relay-key:server-key:user-key"`, with identity keys in connection order
+and the user key last. These are SS2022 extensible identity headers (EIH), not
+separate entries in `client_chain`.
+
+Single-key SS2022 configurations are unchanged. Identity chains are client-only
+and are not supported by `2022-blake3-chacha20-poly1305`. Legacy Shadowsocks
+passwords may still contain literal colons. Shoes does not accept multi-user
+identity chains in server configurations.
+
+`udp_enabled: true` on the client uses the same identity handshake for SagerNet
+UDP-over-TCP and requires a UoT-capable upstream. It does not enable native
+SS2022 UDP. See [examples/shadowsocks-2022-client.yaml](examples/shadowsocks-2022-client.yaml).
+
 ### Snell
 ```yaml
 protocol:
@@ -999,6 +1242,50 @@ receive windows, the H2 library's 16 MiB response-header decoding limit, and no 
 HTTP/2 PING watchdog. Peer stream limits and timeouts still apply. In particular,
 Caddy v2.11.7 defaults to a one-minute request-body idle timeout, which can end a
 quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
+
+## Native DNS Freshness
+
+Omitting a listener's `dns` or leaving `dns.servers` empty uses native OS/NSS
+hostname resolution with a **60-second application memoization window**. The
+same default resolver serves controller probes. The window starts when a
+successful lookup finishes; an entry expires at the window boundary. All returned
+usable addresses and their original order are retained.
+Errors and empty results are not cached, and expired answers are not served on
+failure. Each cache has a lazy, bounded 10,000-entry LRU keyed by exact hostname;
+results are shared across ports, with each caller receiving its requested port.
+Eviction can cause earlier refresh. Concurrent misses share a lookup, up to
+1,024 participating callers per resolver. Excess callers look up independently;
+this is not an OS lookup concurrency cap. Cancelling the owner makes surviving
+callers retry within their remaining deadlines. No background refresh is added,
+and already-running OS calls cannot be stopped.
+
+Explicit `dns: {servers: system}` continues to use OS/NSS lookup **without
+application memoization or concurrent lookup sharing**. To select a different
+fixed window, use a system server options object, inline or in a named DNS group:
+
+```yaml
+dns:
+  servers:
+    url: system
+    native_cache_secs: 15
+```
+
+`native_cache_secs` accepts an integer from 0 to 4294967295 seconds. Omitted or
+`0` disables memoization for this explicit system entry. It is rejected on
+non-system upstreams, including when set to `0`; unknown options and invalid
+values are rejected. The option belongs to the server options object, not the
+outer `dns` object. Existing `timeout_secs` remains a lookup deadline, not cache
+freshness; `connect_timeout_secs` and `attempts` do not control native caching.
+
+This is a load/freshness trade-off, **not DNS TTL compliance**: the OS lookup API
+does not provide record TTLs. Shorter windows increase OS lookups; disabling the
+Shoes cache cannot bypass caches in the OS, NSS modules, or upstream resolvers.
+Native hosts-file/NSS behavior is preserved. New flows can see updated answers
+after expiry; established flows retain their pinned destination. This setting
+controls native hostname lookup caching, not every DNS-related cache. Hickory
+caches and Fake-IP mappings/TTLs are unchanged.
+
+See [the DNS tuning example](examples/dns_tuning.yaml).
 
 ## Fake DNS
 
@@ -1320,7 +1607,8 @@ before a reload stops existing listeners. Invalid sources reject the candidate.
 Automatic reload watches imported files as well as configs. A parseable rejected
 candidate keeps its source paths watched, so creating or repairing a missing file
 can recover without another config edit. Active sources remain watched until a
-replacement activates. `--no-reload` disables file watches; SIGHUP still reloads.
+replacement activates. `--no-reload` disables automatic full reloads; SIGHUP
+still reloads, and live server-certificate rotation remains enabled.
 Established connections retain their original rules until they drain. New routing
 caches belong to the new configuration; Fake DNS pools are preserved separately.
 
@@ -1543,6 +1831,216 @@ Define certificates once and reference throughout configuration.
           type: http
 ```
 
+## Certificate Sources
+
+Ordinary TLS targets and QUIC listeners can share a named certificate source.
+Use `certificate_source` instead of `cert` and `key`; combining them is an error.
+Existing inline certificates, file paths, and named PEMs remain supported.
+
+```yaml
+- certificate_source: public
+  type: files
+  cert: /etc/shoes/certs/fullchain.pem
+  key: /etc/shoes/certs/privkey.pem
+
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    tls_targets:
+      proxy.example.com:
+        certificate_source: public
+        protocol: {type: trojan, password: change-me}
+
+- address: "0.0.0.0:443"
+  transport: quic
+  quic_settings:
+    certificate_source: public
+  protocol: {type: hysteria2, password: change-me}
+```
+
+There is one runtime worker per source, not per listener. File sources use the
+same filesystem watcher machinery as configuration files, with a 250 ms quiet
+period after the last relevant event. They support atomic rename and symlink
+replacement. Both the full certificate chain and its matching private key must
+validate before publication. Separate file writes, missing files, malformed
+data, key mismatches, and invalid validity
+periods leave the last good pair in place. Failed updates retry every second;
+a 60-second internal reconciliation also recovers missed events or unavailable
+watches. Neither interval is a configuration setting. Errors are rate-limited
+and never include private material. An expired source fails new handshakes
+rather than serving a substitute certificate. Existing connections continue
+uninterrupted.
+
+Initial file-source loading (including legacy paths) rejects expired or not-yet-valid
+chains, malformed or misordered chains, and PEM files larger than 1 MiB. A rejected
+configuration reload leaves the current listeners running and watches the candidate's
+file paths so repairing the pair retries the reload. After activation, identity-only
+changes use live rotation, not a full reload.
+
+**Upgrade warning:** These checks also apply to existing `cert`/`key` file paths
+and file-backed named PEMs, even without a configuration change. Previously accepted
+expired or not-yet-valid certificates and misordered bundles now reject at startup;
+running file sources stop serving at expiry, including when clients disable
+verification or pin a fingerprint. Renew expired certificates, put bundles in
+leaf-to-issuer order, remove expired cross-signs and certificates outside that chain,
+and synchronize the system clock before starting Shoes. Child-to-issuer signatures
+must use algorithms supported by the TLS provider: no SHA-1, and RSA issuer keys
+must be at least 2048 bits. Reissue certificates with unsupported signatures.
+Inline-only pairs retain their previous static behavior.
+
+Legacy `cert`/`key` paths, including paths referenced through named PEMs, also
+rotate live through these watches. Inline-only pairs stay static. This applies
+to ordinary inbound TLS and QUIC, including Hysteria2, TUIC and XHTTP. Outbound
+client certificates, trust roots, and local ShadowTLS handshake certificates
+instead trigger a full CLI configuration reload when their referenced files
+change, including named PEM references. If a file serves both roles, a full
+reload is still necessary. REALITY's handshake behavior is unchanged.
+
+New handshakes use the current certificate without replacing TCP listeners or
+QUIC endpoints. TLS session state is scoped to the certificate generation and
+the listener's security policy: sessions resume within a generation, but not
+across rotation or expiration. Existing TCP and QUIC sessions are not retired.
+
+### Built-in ACME
+
+ACME uses `instant-acme` and explicitly configured domains. Start with your CA's
+staging directory. No certificate is issued during `--dry-run`.
+
+```yaml
+- certificate_source: public
+  type: acme
+  domains: [proxy.example.com]
+  directory_url: https://acme-staging-v02.api.letsencrypt.org/directory
+  state_dir: /var/lib/shoes/acme/public
+  contacts: [mailto:operator@example.com]
+  # Read the CA's terms, then set this to its exact meta.termsOfService URL.
+  terms_of_service: https://example.invalid/replace-with-accepted-ca-terms-url
+  challenge:
+    type: http01
+    listen: ["0.0.0.0:8080"]
+```
+
+Reference `public` from TLS or QUIC as in the file-source example. Domains must
+be unique lowercase ASCII DNS names (use punycode for internationalized names).
+Every named TLS target using an ACME source must be covered by its domains.
+There is no issuance based on incoming SNI.
+
+`terms_of_service` is explicit acceptance of that exact URL, not blanket
+acceptance of future terms. Shoes checks the directory's `meta.termsOfService`
+before account operations and refuses a changed URL. Review new terms and
+update the configuration to accept them. If a private CA publishes no terms,
+omit this field; a subsequently advertised terms URL still requires explicit
+acceptance. Accounts requiring external account
+binding are not supported in this version.
+
+HTTP-01 requirements:
+
+- The CA must reach public TCP port 80 for every domain, forwarded to one of the
+  explicit `listen` addresses. Shoes never implicitly binds port 80.
+- The challenge listener is independent of proxy listeners, so UDP-only QUIC
+  deployments can use HTTP-01. A reverse proxy/CDN must forward the exact
+  `/.well-known/acme-challenge/` path and original Host header.
+- Listen addresses must not overlap another HTTP-01 source or a TCP proxy
+  listener. Use a single multi-domain source when sharing the challenge address.
+  Dry-run checks literal addresses and port ranges; a hostname-bound TCP
+  listener on the same port is conservatively treated as a conflict.
+- Only exact, pending, unexpired GET challenges are answered. Unknown tokens
+  return 404. Headers are limited to 8 KiB / 32 fields, with at most 64 concurrent
+  connections per address and a 10-second request lifetime.
+
+For TLS-ALPN-01, replace the `challenge` mapping with:
+
+```yaml
+  challenge: {type: tls_alpn01}
+```
+
+The CA must reach public TCP port 443, forwarded to an existing outermost Shoes
+TLS listener covering every configured domain. This is not QUIC, ShadowTLS or
+REALITY validation. An intermediate TLS terminator must pass the handshake
+through, including SNI and ALPN. Shoes only answers the sole offered protocol
+`acme-tls/1` for a pending configured SNI. The short-lived challenge response
+uses the RFC 8737 critical `acmeIdentifier` extension and never enters the proxy
+handler or replaces the ordinary certificate. Normal ALPN, client authentication,
+fallback routing and QUIC policy are unchanged.
+
+At first start, proxy and challenge listeners bind before issuance begins.
+Normal handshakes for a source without a certificate fail until issuance
+succeeds; `Servers ready` means listeners are bound, not that ACME has finished.
+A valid cached certificate allows immediate startup during a CA outage.
+
+Shoes persists the account key before registration, account credentials,
+in-progress orders and CSR keys, and the certificate/key pair in one atomically
+replaced, synced state file. Do not edit it or share it between sources. On Unix,
+the state directory must be owned by the running user with mode 0700, and files
+use 0600. Other platforms use their inherited filesystem access controls; place
+the directory in private application storage. An exclusive OS file lock prevents
+multiple processes or embedded lifecycles from owning the same directory.
+Back up the whole directory securely. Changing the CA or domain list requires a
+distinct state directory; staging and production must never share one.
+
+Renewal normally begins with one third of the certificate's lifetime remaining.
+ARI is checked while idle and can request earlier renewal when the CA and
+certificate support it. Its Retry-After applies only to ARI; optional checks,
+including account setup, cannot delay due renewal. The source worker alone
+schedules requests and durable deadlines. Pending orders use a five-second
+polling interval unless the CA requests a longer wait. Transient
+failures preserve valid material and use jittered exponential backoff from 60
+seconds to 6 hours, honoring longer CA Retry-After values. Retry-After waits over
+100 years or outside the platform clock range are rejected. Each worker step is
+bounded to 10 minutes. Pending and processing orders are polled until the CA
+completes, invalidates, or removes them. A completed pair is persisted before
+it becomes live. Storage errors do not publish an unpersisted replacement.
+Order retry deadlines, including successful finalization and resumed orders,
+survive restart; startup logs an inherited delay rather than bypassing it.
+The failure backoff resets after installation or healthy idle, not after a
+deferred wake or a successful intermediate order step. Its exponent is kept
+in memory; the selected deadline survives restart.
+ARI retry deadlines also survive restart, including failed ARI responses.
+Missing or invalid orders are discarded so a later attempt can create a new one.
+Certificate failures and inherited retry delays are visible with the default
+error-only logging; successful issuance and rotation use the info level.
+During deferred polling, pending challenge responses remain
+available until their 10-minute lease expires, the order leaves the pending
+state, or the source is stopped.
+
+CA traffic goes directly through the OS resolver and Shoes' protected TCP socket
+helper, not through proxy rules or the certificate being issued. HTTPS verifies
+the CA hostname and public roots. Optional `ca_cert: /path/to/test-ca.crt`
+replaces those roots for a private CA. Requests have a 30-second total timeout,
+32 KiB response header limit and 1 MiB response body limit; redirects are not
+followed. Plain HTTP directories/endpoints are accepted only on numeric loopback
+addresses for local testing. Never disable verification for a public CA.
+
+Configuration reload reuses unchanged sources and their workers, accounts and
+pending challenges. Changed sources hand off storage and challenge listeners
+when a validated reload commits. Retired challenge ports are released before
+new proxy listeners bind; failed preparation does not mutate live sources.
+When an existing proxy address moves to HTTP-01, its challenge bind is deferred
+until the old proxy has stopped. Narrowing a proxy wildcard within the same IP
+family is also supported. Other challenge addresses are still bound during
+preparation: widening bindings, changing IP families, or replacing a challenge
+wildcard binding may require a restart or two separate reloads to avoid conflicts.
+Removed sources are canceled. CLI and mobile/FFI use the same
+manager, with no process-global certificate registry. Mobile deployments still
+need externally reachable challenge ports and persistent application storage.
+
+`--dry-run` validates configuration, references, domain coverage, challenge
+compatibility, certificate material and declared address conflicts without
+contacting a CA, binding ports, or creating ACME state. An unissued ACME source
+is a valid configuration, not a self-signed placeholder. Existing readable state
+is checked for CA/domain identity mismatches without locking or modifying it;
+the check need not run as the service user.
+Actual OS port conflicts,
+storage ownership and permissions are checked during runtime preparation.
+
+There is no built-in DNS-01, wildcard ACME issuance, DNS vendor API, shell hook,
+Tailscale provider, or Cloudflare Origin CA provider. For wildcard certificates
+or DNS-01, run an external client such as acme.sh, lego or Certbot and use a file
+source. Manually supplied wildcard certificates remain supported.
+
+Examples: [file rotation and reuse](examples/certificates_files.yaml) and
+[ACME with shared TCP/QUIC consumers](examples/certificates_acme.yaml).
+
 ## Advanced Features
 
 ### Vision (XTLS-Vision)
@@ -1618,13 +2116,48 @@ client_chain:
 
 ### Hot Reloading
 
-Configuration changes are automatically detected. `--no-reload` disables file watching; on Unix, SIGHUP still requests a reload.
+Configuration changes are automatically detected. The CLI also watches referenced
+outbound TLS/QUIC client certificates and keys, client-auth CA bundles, local
+ShadowTLS certificates/keys, and ACME custom `ca_cert` files. Changing ACME trust
+roots replaces the affected renewal worker after successful preparation, while
+retaining its account and issued certificate.
+
+Automatic full reloads wait for **5 seconds of quiet after the last relevant
+filesystem event**. Writes to config, rule, or reload-only PEM dependencies share
+that debounce window. Separate certificate/key writes are coalesced; an invalid
+or incomplete candidate is rejected without retiring the running listeners.
+Active and parseable candidate dependencies remain watched, so repairing or
+creating a missing PEM file retries the reload without another config edit.
+Unix SIGHUP bypasses debounce; shutdown also interrupts it immediately.
+
+`--no-reload` disables automatic full-reload watches, not live server-certificate
+rotation or ACME renewal. On Unix, SIGHUP still requests a reload. Embedded/FFI
+instances use the same live server-certificate watcher, but have no full config
+reload loop: reload-only PEM changes require restarting the embedded instance.
 
 On Linux, if directory permissions prevent watching a readable configuration's parent, startup falls back to direct file watches and logs a warning. In-place edits remain detectable, but atomic replacements may be missed; use SIGHUP or grant directory read permission when replacing files.
 
-Replacement configurations, certificates, and DNS resolvers are prepared while the current listeners continue serving. A preparation failure leaves the current configuration running. Once preparation succeeds, listeners are replaced. A failure to activate replacements exits with status 1; there is no rollback after listeners are retired. Existing TCP connections may drain for `global_limits.reload_grace_secs` during successful reloads; QUIC connections are closed.
+Replacement configurations, certificates, and DNS resolvers are prepared while
+the current listeners continue serving. A preparation failure leaves the current
+configuration running. Unchanged fixed TCP listen addresses retain their sockets
+across generations. New-generation TCP and Unix listeners accept queued
+connections only after activation completes; connections may wait in the kernel
+backlog during that interval.
 
-QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. A five-second socket-release guard remains; exceeding it indicates a local cleanup failure and exits with an error rather than announcing a partially ready generation.
+If activation fails, Shoes stops the candidate services and restores the previous
+configuration, including control state, resource limits, DNS ownership, and
+certificate workers. A successful rollback keeps the process running; if rollback
+also fails, Shoes exits with status 1 rather than serving a partial generation.
+Existing TCP connections begin draining when their old listeners retire, for up
+to `global_limits.reload_grace_secs`. That deadline still applies after rollback.
+TUN, WireGuard, and QUIC services are stopped and restarted; their existing
+sessions are not migrated or restored by rollback.
+
+Certificate-source file changes and ACME renewal do not trigger this full reload.
+They rotate live without replacing listeners or closing QUIC connections; see
+[Certificate Sources](#certificate-sources).
+
+QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. If the previous generation's sockets do not retire within the five-second socket-release guard, Shoes exits with an error rather than announcing a partially ready generation.
 
 Candidate QUIC buffer sizes are used during DNS preparation, but `global_limits` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.
 
@@ -1677,6 +2210,45 @@ COMMANDS:
 ```
 
 `check` and `--dry-run` exit with status 0 for valid configuration and 1 for errors. They do not open listeners, create a file watcher, or perform DNS bootstrap networking. Runtime failures such as unavailable bind addresses remain possible after a successful check.
+
+### Configuration Diagnostics
+
+Check the same set of files that will be used at startup:
+
+```bash
+shoes check groups.yaml listeners.yaml
+```
+
+Configuration decoding failures identify the input file and the entry's
+zero-based `config[N]` index. Rule-group decoding also identifies `rules[N]`
+(or `rules` for a single object). For example, an unsupported field in the second
+rule source of the third entry reports `config[2]`, `rules[1]`, and the unknown
+field. YAML syntax and duplicate-key errors retain the parser's original
+diagnostic and line/column information when available, rather than adding an
+entry prefix. For `config[N]` decoding errors, a trailing line/column (if any)
+marks the start of the file's top-level list, not entry N or the failing field;
+use the `config[N]` and `rules[N]` paths for that context.
+
+Errors during certificate loading and semantic validation name the input file
+set, not an inferred single culprit: group references can span files. Checks use
+the native validation path, including graph and transport-composition checks.
+Named PEM entries accept only `pem` and exactly one of `path` or `data`; unknown
+fields are rejected rather than ignored. TCP settings likewise reject unknown
+fields; their only current field is `no_delay` (default `true`).
+
+Diagnostics do not include full YAML excerpts. They are not a redacted config
+export: user-defined names, paths, and some invalid values can appear in errors.
+Review diagnostics before sharing them. No normalized-config output is provided.
+
+Offline regression coverage fully validates the representative
+[SOCKS](examples/socks_basic.yaml), [HTTP-through-SOCKS](examples/http_through_socks.yaml),
+[multi-hop](examples/multi_hop_chain.yaml), [controller](examples/clash_api.yaml),
+and [local rule-source](examples/rule_sources.yaml) examples. Other examples may
+need deployment-specific certificates, keys, files, or platform support; parsing
+an example alone does not establish runtime validity.
+
+Optional reference generation, editor schema support, and strict subset conversion
+are described in [Configuration Tooling Follow-Ups](CONFIG_TOOLING_FOLLOWUP.md).
 
 ## Tips
 

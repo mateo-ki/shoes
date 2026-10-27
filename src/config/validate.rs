@@ -28,12 +28,41 @@ const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 pub struct ValidatedConfigs {
     pub catalog: Option<crate::control::catalog::Catalog>,
     pub control: super::ControlConfig,
-    pub rule_files: Vec<std::path::PathBuf>,
+    pub certificates: Vec<std::sync::Arc<crate::certificates::Source>>,
+    pub reload_files: Vec<std::path::PathBuf>,
     pub global_limits: GlobalLimits,
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
     pub wireguard_endpoints: Vec<super::types::wireguard::WireguardDeviceConfig>,
+}
+
+impl ValidatedConfigs {
+    #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi", test))]
+    pub(crate) fn validate_ffi_support(&self) -> std::io::Result<()> {
+        self.control.reject_ffi()?;
+        if self
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.selection.health.definitions.is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fallback groups require the CLI generation lifecycle",
+            ));
+        }
+        if self
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.selection.automatic.0.is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "url-test groups require the process runtime and are not supported by FFI",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Validates configs and returns startable server configs with expanded DNS groups.
@@ -46,10 +75,12 @@ pub struct ValidatedConfigs {
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
 pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    let certificates = crate::certificates::configure(&mut all_configs)?;
     let catalog = crate::control::catalog::Catalog::capture(&mut all_configs)?;
     let mut control = super::ControlConfig::default();
     let mut compiler = crate::rules::Compiler::default();
-    let rule_files = crate::rule_set::dependencies(&mut all_configs)?;
+    let mut reload_files = crate::rule_set::dependencies(&mut all_configs)?;
+    reload_files.extend(super::pem_reload_dependencies(&mut all_configs)?);
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
@@ -108,6 +139,7 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
                     ));
                 }
             }
+            Config::CertificateSource(_) => {}
             Config::GlobalLimits(limits) => {
                 if global_limits.replace(limits).is_some() {
                     return Err(std::io::Error::new(
@@ -185,6 +217,8 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
         for config in configs.iter_mut() {
             validate_client_config(config, &named_pems, global_limits)?;
         }
+        // Unused groups can still be instantiated by controller and URL-test probes.
+        super::health::validate_chain(std::iter::once(configs.iter()))?;
     }
 
     // Extract inline DNS configs from server/tun configs into dns_groups.
@@ -339,7 +373,8 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     let mut validated = ValidatedConfigs {
         catalog,
         control,
-        rule_files,
+        certificates,
+        reload_files,
         global_limits,
         configs: result,
         dns_groups: final_dns_groups,
@@ -806,6 +841,7 @@ fn validate_dns_group_ref(
 /// Expands client chains (resolves group refs to configs) and validates:
 /// - Inline client configs (PEMs, etc.)
 /// - Protocol compatibility (system doesn't support chains, UDP/H3 only direct chains)
+/// - System-only use of native_cache_secs
 /// - Bootstrap URL validity (must be a known group or valid IP-only URL)
 fn expand_dns_specs(
     specs: &[DnsServerSpec],
@@ -823,6 +859,12 @@ fn expand_dns_specs(
         // Parse URL to validate and check protocol
         let parsed_url = ParsedDnsUrl::parse_with_server_name(url_str, server_name_override)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        if spec.native_cache_secs().is_some() && !matches!(parsed_url, ParsedDnsUrl::System) {
+            return Err(std::io::Error::other(
+                "native_cache_secs is only supported for system DNS resolver",
+            ));
+        }
 
         // Expand and validate client chains
         let client_chains_raw = spec.client_chains();
@@ -906,6 +948,7 @@ fn expand_dns_specs(
             timeout_secs: spec.timeout_secs(),
             connect_timeout_secs: spec.connect_timeout_secs(),
             attempts: spec.attempts(),
+            native_cache_secs: spec.native_cache_secs().unwrap_or(0),
         });
     }
 
@@ -1038,6 +1081,7 @@ fn validate_server_config(
             &quic_settings.cert,
             &quic_settings.key,
             &quic_settings.client_ca_certs,
+            quic_settings.certificate_binding.as_ref(),
         )?;
     }
     if server_config.transport != Transport::Tcp && server_config.tcp_settings.is_some() {
@@ -1420,6 +1464,7 @@ fn validate_client_proxy_config(
     default_sni: Option<&str>,
 ) -> std::io::Result<()> {
     match client_proxy_config {
+        ClientProxyConfig::Shadowsocks { config, .. } => config.validate_keys()?,
         ClientProxyConfig::Vmess {
             user_id, cipher, ..
         } => {
@@ -1560,14 +1605,16 @@ fn validate_server_certificates(
     cert: &str,
     key: &str,
     ca: &NoneOrSome<String>,
+    source: Option<&std::sync::Arc<crate::certificates::Source>>,
 ) -> std::io::Result<()> {
-    crate::rustls_config_util::try_create_server_config(
+    crate::rustls_config_util::try_create_server_config_with_source(
         cert.as_bytes(),
         key.as_bytes(),
         ca.iter().map(|pem| pem.as_bytes().to_vec()).collect(),
         &[],
         &[],
         &Default::default(),
+        source,
     )
     .map(|_| ())
 }
@@ -1673,7 +1720,7 @@ fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
             if let ShadowsocksConfig::Legacy { password, .. } = config {
                 validate_nonempty_secret(password, "Shadowsocks")?;
             }
-            config.validate_key_len()?;
+            config.validate_server_key()?;
         }
         ServerProxyConfig::Anytls { users, .. } => {
             for user in users.iter() {
@@ -1804,6 +1851,7 @@ fn validate_server_proxy_config(
                     &tls_server_config.cert,
                     &tls_server_config.key,
                     &tls_server_config.client_ca_certs,
+                    tls_server_config.certificate_binding.as_ref(),
                 )?;
 
                 let TlsServerConfig {
@@ -1849,6 +1897,7 @@ fn validate_server_proxy_config(
                     &tls_server_config.cert,
                     &tls_server_config.key,
                     &tls_server_config.client_ca_certs,
+                    tls_server_config.certificate_binding.as_ref(),
                 )?;
                 validate_client_fingerprints(&mut tls_server_config.client_fingerprints)?;
 
@@ -1904,6 +1953,7 @@ fn validate_server_proxy_config(
                         &local_handshake.cert,
                         &local_handshake.key,
                         &local_handshake.client_ca_certs,
+                        None,
                     )?;
                     validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
                 } else if let ShadowTlsServerHandshakeConfig::Remote(remote_handshake) = handshake {
@@ -2176,6 +2226,7 @@ fn validate_client_chain(
         validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
     }
     expand_client_chain(hops, client_groups)?;
+    super::health::validate_chain(hops.iter().map(super::health::clients))?;
     validate_connector_positions(hops, chain_index)
 }
 
@@ -2318,6 +2369,33 @@ fn expand_client_chain(
         }
     }
 
+    let is_fallback = |selection: &ConfigSelection<ClientConfig>| match selection {
+        ConfigSelection::Config(client) => client
+            .control
+            .as_ref()
+            .is_some_and(crate::control::catalog::MemberOrigin::has_fallback),
+        ConfigSelection::GroupName(_) => false,
+    };
+    let mut has_fallback = false;
+    let mut path_count = Some(1usize);
+    for hop in &expanded_hops {
+        match hop {
+            ClientChainHop::Single(selection) => has_fallback |= is_fallback(selection),
+            ClientChainHop::Pool(pool) => {
+                path_count = path_count.and_then(|count| count.checked_mul(pool.iter().count()));
+                has_fallback |= pool.iter().any(is_fallback);
+            }
+        }
+    }
+    if has_fallback && path_count.is_none_or(|count| count > crate::control::health::MAX_PATHS) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "fallback exceeds {} concrete chain paths",
+                crate::control::health::MAX_PATHS
+            ),
+        ));
+    }
     *client_chain = if expanded_hops.len() == 1 {
         OneOrSome::One(expanded_hops.into_iter().next().unwrap())
     } else {
@@ -2520,10 +2598,49 @@ mod tests {
             config: ShadowsocksConfig::Aead2022 {
                 cipher: "aes-128-gcm".try_into().unwrap(),
                 key_bytes: vec![0; 1].into_boxed_slice(),
+                identity_keys: Vec::new(),
             },
             udp_enabled: true,
         };
         assert!(validate_server_auth(&protocol).is_err());
+    }
+
+    #[test]
+    fn shadowsocks_identity_keys_validate_programmatic_clients_and_reject_servers() {
+        for cipher in ["aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"] {
+            let cipher: crate::shadowsocks::ShadowsocksCipher = cipher.try_into().unwrap();
+            let required = cipher.key_len();
+            for (user_len, identity_len) in [
+                (required, 0),
+                (required, required),
+                (required, required + 1),
+                (0, required),
+                (required + 1, required),
+            ] {
+                let config = ShadowsocksConfig::Aead2022 {
+                    key_bytes: vec![0x33; user_len].into_boxed_slice(),
+                    identity_keys: vec![vec![0x11; identity_len].into_boxed_slice()],
+                    cipher,
+                };
+                let mut client = ClientProxyConfig::Shadowsocks {
+                    config: config.clone(),
+                    udp_enabled: true,
+                };
+                assert_eq!(
+                    validate_client_proxy_config(&mut client, &HashMap::new(), None).is_ok(),
+                    user_len == required
+                        && identity_len == required
+                        && matches!(cipher.name(), "aes-128-gcm" | "aes-256-gcm")
+                );
+                assert!(
+                    validate_server_auth(&ServerProxyConfig::Shadowsocks {
+                        config,
+                        udp_enabled: true,
+                    })
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2950,7 +3067,7 @@ mod tests {
                 ))),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-group".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -2967,13 +3084,13 @@ mod tests {
         // group-b has no dependencies, group-a references group-b
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-a".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-b".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -2989,13 +3106,13 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-a".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-b".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-a".to_string())),
@@ -3016,7 +3133,7 @@ mod tests {
         use crate::config::types::ClientConfigGroup;
 
         let configs = vec![Config::ClientConfigGroup(ClientConfigGroup {
-            strategy: Default::default(),
+            group_type: Default::default(),
             default: None,
             client_group: "group-a".to_string(),
             client_proxies: OneOrSome::One(ConfigSelection::GroupName("nonexistent".to_string())),
@@ -3038,25 +3155,25 @@ mod tests {
         // Diamond: a -> b, a -> c, b -> d, c -> d
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-d".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-c".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-b".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-a".to_string(),
                 client_proxies: OneOrSome::Some(vec![
@@ -3075,19 +3192,19 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "us-proxies".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "eu-proxies".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "all-proxies".to_string(),
                 client_proxies: OneOrSome::Some(vec![
@@ -3539,6 +3656,7 @@ mod tests {
                 timeout_secs: 10,
                 connect_timeout_secs: 5,
                 attempts: 1,
+                native_cache_secs: None,
             }),
         })];
 
@@ -3549,6 +3667,47 @@ mod tests {
             err.contains("client_chain is not supported for system DNS"),
             "Expected system DNS client_chain error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_dns_native_cache_only_accepts_system_specs() {
+        for url in [
+            "system",
+            "udp://192.0.2.1",
+            "tcp://192.0.2.1",
+            "tls://192.0.2.1",
+            "https://192.0.2.1/dns-query",
+            "h3://192.0.2.1/dns-query",
+        ] {
+            for seconds in [0, 7] {
+                let yaml = format!(
+                    "- dns_group: native\n  dns_servers: [{{url: '{url}', native_cache_secs: {seconds}}}]\n- dns_group: composed\n  dns_servers: native\n"
+                );
+                let result = create_server_configs(serde_yaml::from_str(&yaml).unwrap());
+                if url == "system" {
+                    let config = result.unwrap();
+                    assert_eq!(config.dns_groups.len(), 2);
+                    for group in config.dns_groups {
+                        assert_eq!(group.specs[0].native_cache_secs, seconds);
+                    }
+                } else {
+                    let error = result.err().expect("non-system cache option must fail");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("native_cache_secs is only supported for system")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dns_tuning_example_validates() {
+        create_server_configs(
+            serde_yaml::from_str(include_str!("../../examples/dns_tuning.yaml")).unwrap(),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3566,7 +3725,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
@@ -3585,6 +3744,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3605,7 +3765,7 @@ mod tests {
         // Create a direct chain - should be allowed for UDP (for bind_interface).
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "direct-chain".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3624,6 +3784,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3646,7 +3807,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
@@ -3665,6 +3826,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3685,7 +3847,7 @@ mod tests {
         // Create a direct chain - should be allowed for H3 (for bind_interface).
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "direct-chain".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3704,6 +3866,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3717,7 +3880,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3736,6 +3899,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3750,7 +3914,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3769,6 +3933,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3783,7 +3948,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3802,6 +3967,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3947,6 +4113,7 @@ mod tests {
                         timeout_secs: 10,
                         connect_timeout_secs: 5,
                         attempts: 1,
+                        native_cache_secs: None,
                     },
                 ]),
             }),

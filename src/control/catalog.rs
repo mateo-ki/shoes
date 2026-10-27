@@ -8,7 +8,7 @@ use super::selection::{
 };
 use super::store::valid_name;
 use crate::config::{
-    ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection, GroupStrategy,
+    ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection, GroupType,
     RuleActionConfig,
 };
 
@@ -20,23 +20,43 @@ pub struct MemberOrigin {
 }
 
 impl MemberOrigin {
-    pub fn has_selector(&self) -> bool {
-        self.path
-            .iter()
-            .any(|(group, _)| self.selection.definitions().contains_key(group))
+    fn manages(&self, group: &str) -> bool {
+        self.selection.definitions().contains_key(group)
+            || self.selection.automatic.0.contains_key(group)
     }
 
-    pub fn selector_path(&self) -> Vec<(String, String)> {
+    pub fn has_selector(&self) -> bool {
+        self.path.iter().any(|(group, _)| self.manages(group))
+    }
+
+    pub(crate) fn has_fallback(&self) -> bool {
+        self.path
+            .iter()
+            .any(|(group, _)| self.selection.health.definitions.contains_key(group))
+    }
+
+    pub(crate) fn policy_path(&self) -> Vec<(String, String)> {
+        self.path
+            .iter()
+            .filter(|(group, _)| {
+                self.manages(group) || self.selection.health.definitions.contains_key(group)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn allowed(&self, choices: &Choices) -> bool {
+        self.path
+            .iter()
+            .all(|(group, member)| choices.get(group).is_none_or(|selected| selected == member))
+    }
+
+    pub(crate) fn manual_selector_path(&self) -> Vec<(String, String)> {
         self.path
             .iter()
             .filter(|(group, _)| self.selection.definitions().contains_key(group))
             .cloned()
             .collect()
-    }
-    pub fn allowed(&self, choices: &Choices) -> bool {
-        self.path
-            .iter()
-            .all(|(group, member)| choices.get(group).is_none_or(|selected| selected == member))
     }
 
     pub fn chains(&self) -> impl Iterator<Item = String> + '_ {
@@ -56,7 +76,7 @@ pub fn chain_selection_key(
                     client
                         .control
                         .as_ref()
-                        .map(MemberOrigin::selector_path)
+                        .map(MemberOrigin::policy_path)
                         .unwrap_or_default(),
                 );
                 Ok(())
@@ -77,7 +97,7 @@ pub struct RuleDescription {
 pub enum CatalogNode {
     Group {
         members: Vec<String>,
-        strategy: GroupStrategy,
+        group_type: GroupType,
     },
     Leaf(Box<ClientConfig>),
     Reject,
@@ -159,15 +179,20 @@ impl Catalog {
     pub fn capture(configs: &mut [Config]) -> io::Result<Option<Self>> {
         for config in configs.iter() {
             if let Config::ClientConfigGroup(group) = config
-                && group.strategy != GroupStrategy::Selector
+                && group.group_type != GroupType::Selector
                 && group.default.is_some()
             {
                 return Err(invalid("default is only valid for selector groups"));
             }
+            if let Config::ClientConfigGroup(group) = config
+                && let GroupType::Fallback { health_check } = &group.group_type
+            {
+                health_check.validate()?;
+            }
         }
         let enabled = configs.iter().any(|config| match config {
             Config::ClashApi(_) | Config::CacheFile(_) => true,
-            Config::ClientConfigGroup(group) => group.strategy == GroupStrategy::Selector,
+            Config::ClientConfigGroup(group) => group.group_type != GroupType::RoundRobin,
             _ => false,
         });
         if !enabled {
@@ -199,7 +224,7 @@ impl Catalog {
                         group.client_group.clone(),
                         CatalogNode::Group {
                             members: Vec::new(),
-                            strategy: group.strategy,
+                            group_type: group.group_type.clone(),
                         },
                     );
                 }
@@ -246,40 +271,73 @@ impl Catalog {
             )?;
         }
         let mut definitions = SelectorDefinitions::new();
+        let mut automatic = super::url_test::AutomaticGroups::default();
+        let mut fallbacks = std::collections::BTreeMap::new();
         for config in configs.iter() {
             if let Config::ClientConfigGroup(group) = config {
                 let members: Vec<_> = group.client_proxies.iter().map(member_name).collect();
-                if group.strategy == GroupStrategy::Selector {
-                    let has_unnamed_member = group.client_proxies.iter().any(|member| {
-                        matches!(member, ConfigSelection::Config(client) if client.name.is_none())
-                    });
-                    if has_unnamed_member {
-                        return Err(invalid("inline selector members require explicit names"));
+                match &group.group_type {
+                    GroupType::Fallback { health_check } => {
+                        if members.is_empty()
+                            || members
+                                .iter()
+                                .collect::<std::collections::HashSet<_>>()
+                                .len()
+                                != members.len()
+                        {
+                            return Err(invalid("fallback members must be nonempty and distinct"));
+                        }
+                        fallbacks.insert(
+                            group.client_group.clone(),
+                            super::health::FallbackDefinition {
+                                members: members.clone(),
+                                check: health_check.clone(),
+                            },
+                        );
                     }
-                    definitions.insert(
-                        group.client_group.clone(),
-                        SelectorDefinition {
-                            members: members.clone(),
-                            default: group.default.as_ref().map(|name| {
-                                if members.contains(name) {
-                                    name.clone()
-                                } else {
-                                    api_group(name).to_owned()
-                                }
-                            }),
-                        },
-                    );
+                    GroupType::Selector => {
+                        let has_unnamed_member = group.client_proxies.iter().any(|member| {
+                            matches!(member, ConfigSelection::Config(client) if client.name.is_none())
+                        });
+                        if has_unnamed_member {
+                            return Err(invalid("inline selector members require explicit names"));
+                        }
+                        definitions.insert(
+                            group.client_group.clone(),
+                            SelectorDefinition {
+                                members: members.clone(),
+                                default: group.default.as_ref().map(|name| {
+                                    if members.contains(name) {
+                                        name.clone()
+                                    } else {
+                                        api_group(name).to_owned()
+                                    }
+                                }),
+                            },
+                        );
+                    }
+                    GroupType::UrlTest(config) => {
+                        automatic.insert(
+                            group.client_group.clone(),
+                            config.clone(),
+                            members.clone(),
+                        )?;
+                    }
+                    GroupType::RoundRobin => {}
                 }
                 nodes.insert(
                     group.client_group.clone(),
                     CatalogNode::Group {
                         members,
-                        strategy: group.strategy,
+                        group_type: group.group_type.clone(),
                     },
                 );
             }
         }
-        let selection = SelectionOwner::new(None)?.prepare(definitions)?;
+        let mut selection = SelectionOwner::new(None)?.prepare(definitions)?;
+        let view = Arc::get_mut(&mut selection).unwrap();
+        view.automatic = automatic;
+        view.health = super::health::HealthState::new(fallbacks);
         crate::config::client_visit::visit_configs(configs, &mut |client| {
             if let Some(origin) = &mut client.control {
                 origin.selection = selection.clone();
@@ -411,7 +469,7 @@ mod tests {
       address: west.example:1080
       protocol: {type: socks}
 - client_group: outbound
-  strategy: selector
+  type: selector
   default: child
   client_proxies: [child, direct]
 - address: 127.0.0.1:1080
@@ -529,11 +587,12 @@ mod tests {
             CONFIG.replace("[child, direct]", "[child, child]"),
             CONFIG.replace("name: west", "name: east"),
             CONFIG.replace("name: west", "name: GLOBAL"),
-            CONFIG.replace("strategy: selector", "strategy: round-robin"),
+            CONFIG.replace("type: selector", "type: round-robin"),
             CONFIG.replace("[child, direct]", "[{protocol: {type: direct}}]"),
         ] {
+            let configs = serde_yaml::from_str(&yaml);
             assert!(
-                crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).is_err()
+                configs.is_err() || crate::config::create_server_configs(configs.unwrap()).is_err()
             );
         }
     }

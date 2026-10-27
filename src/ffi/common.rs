@@ -2,8 +2,7 @@
 //!
 //! This module contains platform-independent code that both iOS and Android use.
 
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -13,12 +12,15 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Config, convert_cert_paths, load_config_str};
 use crate::dns::build_dns_registry_for_runtime;
+use crate::logging::{FILE_LOG_FLUSH_TIMEOUT, FileLogWriter, LogWriter};
 use crate::tcp::tcp_server::start_servers;
 #[cfg(unix)]
 use crate::tun::run_tun_from_config;
 
 /// Global log file handle for file-based logging.
-pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<File>>> = OnceLock::new();
+pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<Arc<FileLogWriter>>>> = OnceLock::new();
+static LOG_FILE_SETUP: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+pub static LOGGER_SETUP: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Global flag to track if logger has been initialized.
 pub static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -101,35 +103,45 @@ impl Drop for ServerTasks {
 ///
 /// Returns 0 on success, -1 on error.
 pub fn setup_log_file(path_str: &str) -> i32 {
+    let _setup = LOG_FILE_SETUP.lock();
     let file_mutex = LOG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
-
-    match OpenOptions::new().create(true).append(true).open(path_str) {
-        Ok(file) => {
-            *file_mutex.lock() = Some(file);
-            info!("Log file set to: {}", path_str);
-            0
+    let file = match OpenOptions::new().create(true).append(true).open(path_str) {
+        Ok(file) => file,
+        Err(_) => return -1,
+    };
+    let previous = file_mutex.lock().clone();
+    if let Some(previous) = previous {
+        // Retain a stalled worker and refuse replacement rather than accumulating
+        // uninterruptible threads across repeated set-log-file calls.
+        if previous.shutdown_timeout(FILE_LOG_FLUSH_TIMEOUT).is_err() && !previous.is_finished() {
+            return -1;
         }
-        Err(_) => -1,
     }
+    let writer = match FileLogWriter::from_file(file) {
+        Ok(writer) => Arc::new(writer),
+        Err(_) => return -1,
+    };
+    *file_mutex.lock() = Some(writer);
+    info!("Log file set to: {}", path_str);
+    0
 }
 
 /// Write a log message to the log file if configured.
 pub fn write_to_log_file(level: log::Level, target: &str, message: &str) {
-    if let Some(file_mutex) = LOG_FILE.get() {
-        let mut guard = file_mutex.lock();
-        if let Some(ref mut writer) = *guard {
-            let _ = writeln!(writer, "{} [{}] {}", level, target, message);
-        }
+    let writer = LOG_FILE.get().and_then(|slot| slot.lock().clone());
+    if let Some(writer) = writer {
+        writer.write_log(
+            &log::Record::builder().level(level).target(target).build(),
+            &format!("{} [{}] {}", level, target, message),
+        );
     }
 }
 
 /// Flush the log file.
 pub fn flush_log_file() {
-    if let Some(file_mutex) = LOG_FILE.get() {
-        let mut guard = file_mutex.lock();
-        if let Some(ref mut writer) = *guard {
-            let _ = writer.flush();
-        }
+    let writer = LOG_FILE.get().and_then(|slot| slot.lock().clone());
+    if let Some(writer) = writer {
+        writer.flush();
     }
 }
 
@@ -171,6 +183,8 @@ pub fn stop_service() -> bool {
     }
 
     info!("TUN service stop completed");
+    // The process-global logger survives stop/start; reuse its single worker.
+    flush_log_file();
     true
 }
 
@@ -216,7 +230,8 @@ pub async fn start_from_config(
     }
 
     let mut validated = crate::config::compile_configs(configs).await?;
-    validated.control.reject_ffi()?;
+    validated.validate_ffi_support()?;
+    let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
     let crate::config::ValidatedConfigs {
@@ -308,6 +323,7 @@ pub async fn start_from_config(
         }
     }
 
+    certificates.start().await;
     // Run TUN server (blocks until shutdown). close_fd_on_drop = false because mobile owns the FD
     #[cfg(unix)]
     let result = {
@@ -322,6 +338,7 @@ pub async fn start_from_config(
 
     // Cleanup any servers when TUN stops
     join_handles.stop().await;
+    certificates.shutdown().await;
     #[cfg(unix)]
     wireguard_running.stop().await;
 
@@ -330,6 +347,10 @@ pub async fn start_from_config(
 
     result
 }
+
+#[cfg(all(test, unix))]
+#[path = "certificate_tests.rs"]
+mod certificate_tests;
 
 #[cfg(all(test, unix))]
 #[path = "wireguard_tests.rs"]
@@ -347,6 +368,20 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn url_test_configuration_is_rejected_without_a_process_supervisor() {
+        let config = r#"
+- client_group: automatic
+  type: url-test
+  url: http://probe.invalid/
+  client_proxies: [direct]
+"#;
+        let (_shutdown, shutdown) = oneshot::channel();
+        let error = start_from_config(config, shutdown).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("url-test groups"));
+    }
 
     #[test]
     fn lifecycle_requires_a_non_runtime_thread() {

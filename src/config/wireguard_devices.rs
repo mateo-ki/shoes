@@ -44,7 +44,7 @@ impl ClientRegistry {
                 carrier
                     .control
                     .as_ref()
-                    .map(crate::control::catalog::MemberOrigin::selector_path)
+                    .map(crate::control::catalog::MemberOrigin::policy_path)
                     .unwrap_or_default(),
             );
             if carrier.bind_interface.is_unspecified() {
@@ -970,8 +970,8 @@ mod tests {
         let mut configs = json!([
             {"clash_api_address":"127.0.0.1:9090","secret":"test"},
             {"client_group":"vpn","client_proxies":[client()]},
-            {"client_group":"outbound","strategy":"selector","client_proxies":["vpn","direct"]},
-            {"client_group":"another","strategy":"selector","client_proxies":["outbound","vpn"]}
+            {"client_group":"outbound","type":"selector","client_proxies":["vpn","direct"]},
+            {"client_group":"another","type":"selector","client_proxies":["outbound","vpn"]}
         ]);
         assert!(
             validate(configs.clone())

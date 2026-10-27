@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.3.4"
+version = "0.3.5"
 publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
 rust-version = "1.95"
@@ -23,6 +23,10 @@ rustls = { git = "https://github.com/cfal/rustls", rev = "d17d0fc304c03fe6e2c96a
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "cd98c1c4112ed3b2cf2140e1844f266b3d665b53" }
 h3 = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
 h3-quinn = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
+# Backports hickory-dns/hickory-dns#3861 and preserves H3 connection-close failover.
+hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
+hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
+hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
 # Includes nix-rust/nix#2821 for iOS socket feature compatibility.
 nix = { git = "https://github.com/nix-rust/nix", rev = "3eae6d68ec6382fef7b38cd58f97458e59a71af9" }
 # Preserves TCP ACK sequences during retransmission.
@@ -55,6 +59,18 @@ path = "tests/process_contract.rs"
 [[test]]
 name = "rule_allocation"
 path = "tests/rule_allocation.rs"
+
+[[test]]
+name = "retention_allocation"
+path = "tests/retention_allocation.rs"
+
+[[test]]
+name = "matcher_invariants"
+path = "tests/matcher_invariants.rs"
+
+[[test]]
+name = "rule_properties"
+path = "tests/rule_properties.rs"
 
 [[test]]
 name = "integration"
@@ -117,6 +133,7 @@ h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-int
 h3-quinn = "*"
 hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
 http = "*"
+httpdate = "1"
 http-body-util = "*"
 httparse = "*"
 hyper = { version = "*", features = ["client", "server", "http1", "http2"] }
@@ -124,6 +141,7 @@ hyper-util = { version = "*", features = ["tokio", "server"] }
 hyper-tungstenite = "0.30.0"
 memory-stats = "1.2.0"
 indexmap = "*"
+instant-acme = { version = "=0.8.5", default-features = false, features = ["aws-lc-rs", "rcgen", "time", "x509-parser"] }
 ipnetwork = "0.21"
 libc = "*"
 log = { version = "*", features = ["std", "release_max_level_info"] }
@@ -136,6 +154,7 @@ notify = "*"
 parking_lot = "*"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+quinn-proto = { version = "0.11", default-features = false }
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
@@ -170,7 +189,7 @@ zeroize = "*"
 
 [dev-dependencies]
 tokio = { version = "*", features = ["test-util"] }
-rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 shoes-test-support = { path = "tests/support" }
 tempfile = "*"
 tokio-rustls = "*"

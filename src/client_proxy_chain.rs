@@ -27,12 +27,16 @@ use log::debug;
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::control::catalog::{MemberOrigin, RuleDescription};
+use crate::control::connection_notes::{self, Phase};
 use crate::control::flows::{FlowContext, FlowGuard, FlowInfo};
 use crate::resolver::Resolver;
 use crate::tcp::carrier_dialer::{CarrierDialer, QuicCarrier, RouteKey};
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
+
+#[cfg(test)]
+mod health_tests;
 
 /// Entry in the initial hop (hop 0) pool.
 ///
@@ -67,6 +71,12 @@ impl std::fmt::Debug for InitialHopEntry {
 }
 
 impl InitialHopEntry {
+    fn socket(&self) -> &Arc<dyn SocketConnector> {
+        match self {
+            Self::Direct(socket) | Self::Wireguard(socket) | Self::Proxy { socket, .. } => socket,
+        }
+    }
+
     /// Returns true if this entry supports UDP.
     pub fn supports_udp(&self) -> bool {
         match self {
@@ -85,6 +95,7 @@ pub struct ClientProxyChain {
     origins: Vec<Vec<Option<MemberOrigin>>>,
     selection: Option<Arc<crate::control::selection::SelectionView>>,
     selector_hops: Vec<bool>,
+    health_paths: Vec<HealthPath>,
     /// Initial hop pool: each entry is either Direct or Proxy.
     /// Socket and proxy are paired and selected together.
     initial_hop: Vec<Arc<InitialHopEntry>>,
@@ -107,6 +118,11 @@ pub struct ClientProxyChain {
     /// true = udp_final_hop_indices points to initial_hop
     /// false = udp_final_hop_indices points to last subsequent hop
     udp_uses_initial_hop: bool,
+}
+
+struct HealthPath {
+    indices: Vec<usize>,
+    checks: Vec<Arc<crate::control::health::ProbeJob>>,
 }
 
 impl std::fmt::Debug for ClientProxyChain {
@@ -142,11 +158,7 @@ impl ClientProxyChain {
             .map(|(i, hop)| hop[indices[i + 1]].clone())
             .collect();
         SelectedRoute {
-            socket: match self.initial_hop[initial_index].as_ref() {
-                InitialHopEntry::Direct(socket)
-                | InitialHopEntry::Wireguard(socket)
-                | InitialHopEntry::Proxy { socket, .. } => socket.clone(),
-            },
+            socket: self.initial_hop[initial_index].socket().clone(),
             initial: Some(self.initial_hop[initial_index].clone()),
             subsequent,
             resolver: resolver.clone(),
@@ -162,7 +174,7 @@ impl ClientProxyChain {
             .iter()
             .flatten()
             .flatten()
-            .find(|origin| origin.has_selector())
+            .find(|origin| origin.has_selector() || origin.has_fallback())
             .map(|origin| origin.selection.clone());
         self.origins = origins;
         self
@@ -173,6 +185,9 @@ impl ClientProxyChain {
             .selection
             .as_ref()
             .map(|selection| selection.snapshot());
+        if !self.health_paths.is_empty() {
+            return self.select_healthy(udp, choices.as_deref().unwrap());
+        }
         (0..self.num_hops())
             .map(|hop| {
                 let final_udp = udp && hop + 1 == self.num_hops();
@@ -203,6 +218,25 @@ impl ClientProxyChain {
                             .is_none_or(|origin| origin.allowed(choices))
                     })
                 };
+                if let Some(selection) = &self.selection
+                    && !selection.automatic.0.is_empty()
+                    && choices.is_some()
+                {
+                    let mut candidates: Vec<_> =
+                        (0..length).filter(allowed).map(candidate).collect();
+                    selection
+                        .automatic
+                        .filter(&self.origins[hop], &mut candidates, final_udp);
+                    if candidates.is_empty() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "selected branch cannot carry this flow",
+                        ));
+                    }
+                    let ordinal =
+                        counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
+                    return Ok(candidates[ordinal]);
+                }
                 let count = if choices.is_some() {
                     (0..length).filter(allowed).count()
                 } else {
@@ -226,6 +260,317 @@ impl ClientProxyChain {
 
     fn origin(&self, hop: usize, index: usize) -> Option<&MemberOrigin> {
         self.origins.get(hop)?.get(index)?.as_ref()
+    }
+
+    fn touch_automatic(&self, indices: &[usize], failed: bool) {
+        if self
+            .selection
+            .as_ref()
+            .is_none_or(|selection| selection.automatic.0.is_empty())
+        {
+            return;
+        }
+        for (hop, &index) in indices.iter().enumerate() {
+            if let Some(origin) = self.origin(hop, index) {
+                for (group, _) in &origin.path {
+                    origin.selection.automatic.touch(group, failed);
+                }
+            }
+        }
+    }
+
+    async fn with_route_activity<T>(
+        &self,
+        indices: &[usize],
+        connect: impl Future<Output = std::io::Result<T>>,
+    ) -> std::io::Result<T> {
+        self.touch_automatic(indices, false);
+        self.initial_hop[indices[0]].socket().record_demand();
+        let result = connect.await;
+        if let Err(error) = &result
+            && crate::control::url_test::remote_failure(error)
+        {
+            self.touch_automatic(indices, true);
+        }
+        result
+    }
+
+    pub(crate) fn record_carrier_demand(&self) {
+        if crate::control::url_test::is_background() {
+            return;
+        }
+        // Shared carriers can have several pinned associations. Wake their groups
+        // without selecting a new route or attributing a destination failure to them.
+        for origin in self.origins.iter().flatten().flatten() {
+            for (group, _) in &origin.path {
+                origin.selection.automatic.touch(group, false);
+            }
+        }
+        for entry in &self.initial_hop {
+            if let InitialHopEntry::Wireguard(socket) = entry.as_ref() {
+                socket.record_demand();
+            }
+        }
+    }
+
+    pub(crate) fn with_health(
+        mut self,
+        hops: &[Vec<crate::config::ClientConfig>],
+        size: usize,
+        resolver: Arc<dyn Resolver>,
+    ) -> std::io::Result<Self> {
+        let selection = self.selection.as_ref().unwrap().clone();
+        let identities: Vec<Vec<_>> = hops
+            .iter()
+            .map(|pool| {
+                pool.iter()
+                    .map(|client| {
+                        let mut nested_origins = Vec::new();
+                        crate::config::client_visit::visit_client(
+                            &mut client.clone(),
+                            &mut |nested| {
+                                nested_origins.push(nested.control.clone());
+                                Ok(())
+                            },
+                        )?;
+                        // visit_client is post-order: exclude the root, retain nested carrier paths.
+                        nested_origins.pop();
+                        let nested_paths: Vec<_> = nested_origins
+                            .iter()
+                            .map(|origin| {
+                                origin
+                                    .as_ref()
+                                    .map(MemberOrigin::policy_path)
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        let dynamic_selectors: Vec<_> = nested_origins
+                            .iter()
+                            .flatten()
+                            .map(MemberOrigin::manual_selector_path)
+                            .filter(|path| !path.is_empty())
+                            .collect();
+                        let mut value = serde_json::to_value((client, nested_paths))
+                            .map_err(std::io::Error::other)?;
+                        value.sort_all_objects();
+                        Ok((value, dynamic_selectors))
+                    })
+                    .collect()
+            })
+            .collect::<std::io::Result<_>>()?;
+        // Enumerate configured path order, with the last hop varying fastest.
+        for ordinal in 0..size {
+            let mut remaining = ordinal;
+            let mut indices = vec![0; hops.len()];
+            for hop in (0..hops.len()).rev() {
+                indices[hop] = remaining % hops[hop].len();
+                remaining /= hops[hop].len();
+            }
+            let path_identities: Vec<_> = indices
+                .iter()
+                .enumerate()
+                .map(|(hop, index)| &identities[hop][*index].0)
+                .collect();
+            let mut dynamic_selectors: Vec<_> = indices
+                .iter()
+                .enumerate()
+                .flat_map(|(hop, index)| identities[hop][*index].1.iter().cloned())
+                .collect();
+            dynamic_selectors.sort_unstable();
+            dynamic_selectors.dedup();
+            let fingerprint = *blake3::hash(
+                &serde_json::to_vec(&path_identities).map_err(std::io::Error::other)?,
+            )
+            .as_bytes();
+            let mut checks = Vec::new();
+            let origins: Vec<_> = indices
+                .iter()
+                .enumerate()
+                .filter_map(|(hop, index)| self.origin(hop, *index))
+                .collect();
+            let selectors = origins
+                .iter()
+                .flat_map(|origin| origin.manual_selector_path())
+                .collect::<Vec<_>>();
+            let definitions = origins
+                .iter()
+                .flat_map(|origin| &origin.path)
+                .filter_map(|(group, _)| selection.health.definitions.get(group));
+            for definition in definitions {
+                let job = selection.health.register(
+                    fingerprint,
+                    &definition.check,
+                    resolver.clone(),
+                    selectors.clone(),
+                    dynamic_selectors.clone(),
+                    || self.pinned(&indices),
+                )?;
+                if !checks.iter().any(|existing| Arc::ptr_eq(existing, &job)) {
+                    checks.push(job);
+                }
+            }
+            self.health_paths.push(HealthPath { indices, checks });
+        }
+        Ok(self)
+    }
+
+    fn pinned(&self, indices: &[usize]) -> Self {
+        // Probe chains are TCP-only and already selected; no policy or UDP metadata is needed.
+        Self {
+            origins: Vec::new(),
+            selection: None,
+            selector_hops: Vec::new(),
+            health_paths: Vec::new(),
+            initial_hop: vec![self.initial_hop[indices[0]].clone()],
+            initial_hop_next_index: AtomicU32::new(0),
+            subsequent_hops: self
+                .subsequent_hops
+                .iter()
+                .enumerate()
+                .map(|(hop, pool)| vec![pool[indices[hop + 1]].clone()])
+                .collect(),
+            subsequent_next_indices: self
+                .subsequent_hops
+                .iter()
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+            udp_final_hop_indices: Vec::new(),
+            udp_final_hop_next_index: AtomicU32::new(0),
+            udp_uses_initial_hop: self.udp_uses_initial_hop,
+        }
+    }
+
+    fn select_healthy(
+        &self,
+        udp: bool,
+        choices: &crate::control::selection::Choices,
+    ) -> std::io::Result<Vec<usize>> {
+        use crate::control::health::Health;
+        let selection = self.selection.as_ref().unwrap();
+        let now = selection.health.sample_time();
+        let mut samples = std::collections::HashMap::new();
+        let mut has_compatible_path = false;
+        // One health/selection snapshot for the entire flow, including every prefix.
+        let mut candidates: Vec<_> = self
+            .health_paths
+            .iter()
+            .filter_map(|path| {
+                if udp
+                    && !self
+                        .udp_final_hop_indices
+                        .contains(path.indices.last().unwrap())
+                {
+                    return None;
+                }
+                if !path.indices.iter().enumerate().all(|(hop, index)| {
+                    self.origin(hop, *index)
+                        .is_none_or(|origin| origin.allowed(choices))
+                }) {
+                    return None;
+                }
+                has_compatible_path = true;
+                let mut fully_healthy = true;
+                for check in &path.checks {
+                    match *samples
+                        .entry(Arc::as_ptr(check))
+                        .or_insert_with(|| check.health(choices, now))
+                    {
+                        Health::Healthy => {}
+                        Health::Unknown => fully_healthy = false,
+                        Health::Failed | Health::Stale => return None,
+                    }
+                }
+                Some((path, fully_healthy))
+            })
+            .collect();
+        if !has_compatible_path {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "selected branch cannot carry this flow",
+            ));
+        }
+        if candidates.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "fallback has no healthy or unknown eligible path",
+            ));
+        }
+        let definitions = &selection.health.definitions;
+        // Resolve fallback priorities across complete paths before latency or pool choices
+        // can discard a healthy candidate. Paths outside each fallback branch remain eligible.
+        for hop in 0..self.num_hops() {
+            let mut branches = Vec::new();
+            for origin in self.origins[hop].iter().flatten() {
+                for (depth, (group, _)) in origin.path.iter().enumerate() {
+                    if definitions.contains_key(group) {
+                        let branch = (&origin.path[..depth], group);
+                        if !branches.contains(&branch) {
+                            branches.push(branch);
+                        }
+                    }
+                }
+            }
+            for (prefix, group) in branches {
+                let member = |path: &HealthPath| {
+                    let origin = self.origin(hop, path.indices[hop])?;
+                    let (name, member) = origin.path.get(prefix.len())?;
+                    (origin.path.starts_with(prefix) && name == group).then_some(member.as_str())
+                };
+                let definition = &definitions[group];
+                let first_member = |require_healthy| {
+                    definition.members.iter().find(|name| {
+                        candidates.iter().any(|(path, fully_healthy)| {
+                            *fully_healthy == require_healthy && member(path) == Some(name.as_str())
+                        })
+                    })
+                };
+                let preferred = first_member(true)
+                    .map(|member| (member, true))
+                    .or_else(|| first_member(false).map(|member| (member, false)));
+                if let Some((preferred, require_healthy)) = preferred {
+                    candidates.retain(|(path, fully_healthy)| {
+                        let Some(name) = member(path) else {
+                            return true;
+                        };
+                        name == preferred && (!require_healthy || *fully_healthy)
+                    });
+                }
+            }
+        }
+        let mut result = Vec::with_capacity(self.num_hops());
+        for hop in 0..self.num_hops() {
+            if !selection.automatic.0.is_empty() {
+                let mut indices: Vec<_> = candidates
+                    .iter()
+                    .map(|(path, _)| path.indices[hop])
+                    .collect();
+                indices.sort_unstable();
+                indices.dedup();
+                selection.automatic.filter(
+                    &self.origins[hop],
+                    &mut indices,
+                    udp && hop + 1 == self.num_hops(),
+                );
+                candidates.retain(|(path, _)| indices.contains(&path.indices[hop]));
+            }
+            let mut indices: Vec<_> = candidates
+                .iter()
+                .map(|(path, _)| path.indices[hop])
+                .collect();
+            indices.sort_unstable();
+            indices.dedup();
+            let counter = if udp && hop + 1 == self.num_hops() {
+                &self.udp_final_hop_next_index
+            } else if hop == 0 {
+                &self.initial_hop_next_index
+            } else {
+                &self.subsequent_next_indices[hop - 1]
+            };
+            let index = indices[counter.fetch_add(1, Ordering::Relaxed) as usize % indices.len()];
+            candidates.retain(|(path, _)| path.indices[hop] == index);
+            result.push(index);
+        }
+        Ok(result)
     }
 
     fn route_names(&self, indices: &[usize]) -> Vec<String> {
@@ -289,6 +634,7 @@ impl ClientProxyChain {
             origins: Vec::new(),
             selection: None,
             selector_hops: Vec::new(),
+            health_paths: Vec::new(),
             initial_hop: initial_hop.into_iter().map(Arc::new).collect(),
             initial_hop_next_index: AtomicU32::new(0),
             subsequent_hops: subsequent_hops
@@ -352,9 +698,22 @@ impl ClientProxyChain {
         if let Some(path) = path {
             *path = self.route_names(&indices);
         }
+        self.with_route_activity(
+            &indices,
+            self.connect_tcp_selected(remote_location, resolver, &indices),
+        )
+        .await
+    }
+
+    async fn connect_tcp_selected(
+        &self,
+        remote_location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        indices: &[usize],
+    ) -> std::io::Result<TcpClientSetupResult> {
         if self.needs_carrier_dialer() {
             return self
-                .selected_route(resolver, &indices)
+                .selected_route(resolver, indices)
                 .connect(remote_location)
                 .await;
         }
@@ -362,7 +721,7 @@ impl ClientProxyChain {
         let entry = self.initial_hop[indices[0]].as_ref();
 
         // Select proxy connectors for subsequent hops
-        let subsequent_proxies = self.select_subsequent_proxies(&indices);
+        let subsequent_proxies = self.select_subsequent_proxies(indices);
 
         debug!(
             "Chain TCP connect: 1 initial + {} subsequent hop(s) -> {}",
@@ -485,8 +844,21 @@ impl ClientProxyChain {
         if let Some(path) = path {
             *path = self.route_names(&indices);
         }
+        self.with_route_activity(
+            &indices,
+            self.connect_udp_selected(resolver, target, &indices),
+        )
+        .await
+    }
+
+    async fn connect_udp_selected(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+        target: ResolvedLocation,
+        indices: &[usize],
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         if self.needs_carrier_dialer() {
-            let route = self.selected_route(resolver, &indices);
+            let route = self.selected_route(resolver, indices);
             return match route.last_proxy() {
                 Some(proxy) => {
                     proxy
@@ -694,6 +1066,130 @@ mod carrier_tests {
     const TRANSPORT_DATA: &[u8] = b"transport";
 
     #[test]
+    fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
+        for route in ["outer", "[inner, inner]"] {
+            let yaml = format!(
+                "
+- client_group: inner
+  type: url-test
+  url: http://inner.invalid/
+  client_proxies:
+    - name: http
+      address: 127.0.0.1:8000
+      protocol: {{type: http}}
+    - name: udp
+      address: 127.0.0.1:8001
+      protocol: {{type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}}
+- client_group: manual
+  type: selector
+  client_proxies: [inner, direct]
+- client_group: outer
+  type: url-test
+  url: http://outer.invalid/
+  client_proxies: [manual, direct]
+- address: 127.0.0.1:1080
+  protocol: {{type: socks}}
+  rules: [{{mask: 0.0.0.0/0, action: allow, client_chain: {route}}}]
+"
+            );
+            let mut validated =
+                crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
+            assert!(validated.control.listeners.is_empty());
+            let catalog = validated.catalog.take().unwrap();
+            let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+                panic!()
+            };
+            let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0)
+            else {
+                panic!()
+            };
+            let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+                panic!()
+            };
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let group =
+                crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver)
+                    .unwrap();
+            let chain = &group.chains[0];
+            let auto = &catalog.selection.automatic;
+            auto.record("http", "http://inner.invalid/", Some(10));
+            auto.record("udp", "http://inner.invalid/", Some(100));
+            auto.record("manual", "http://outer.invalid/", Some(10));
+            auto.record("DIRECT", "http://outer.invalid/", Some(200));
+            if route == "outer" {
+                assert_eq!(chain.select_indices(false).unwrap(), [0]);
+                assert_eq!(chain.select_indices(true).unwrap(), [1]);
+                let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+                owner.activate(catalog.selection.clone()).unwrap();
+                assert!(owner.select("inner", "udp").is_err());
+                owner.select("manual", "DIRECT").unwrap();
+                assert_eq!(chain.select_indices(false).unwrap(), [2]);
+                assert_eq!(chain.select_indices(true).unwrap(), [2]);
+            } else {
+                assert_eq!(chain.select_indices(false).unwrap(), [0, 0]);
+                assert_eq!(chain.select_indices(true).unwrap(), [0, 1]);
+            }
+        }
+    }
+
+    #[test]
+    fn url_test_deep_udp_selection_survives_dashboard_reads() {
+        use serde_json::json;
+        let mut configs: Vec<_> = (0..128)
+            .map(|index| {
+                let member = if index == 127 {
+                    "direct".into()
+                } else {
+                    format!("deep-{}", index + 1)
+                };
+                json!({
+                    "client_group": format!("deep-{index}"),
+                    "client_proxies": [member]
+                })
+            })
+            .collect();
+        configs.push(json!({
+            "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
+            "client_proxies":["deep-0", {"name":"other", "protocol":{"type":"direct"}}]
+        }));
+        configs.push(json!({
+            "address":"127.0.0.1:1080", "protocol":{"type":"socks"},
+            "rules":[{"mask":"0.0.0.0/0", "action":"allow", "client_chain":"auto"}]
+        }));
+        let mut validated =
+            crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
+                .unwrap();
+        let catalog = validated.catalog.take().unwrap();
+        let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+            panic!()
+        };
+        let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
+            panic!()
+        };
+        let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+            panic!()
+        };
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let group = crate::tcp::chain_builder::try_build_client_chain_group(
+            client_chains,
+            resolver.clone(),
+        )
+        .unwrap();
+        let generation = crate::control::runtime::Generation {
+            id: 1,
+            leaf_udp_support: crate::clash_api::dto::leaf_udp_support(&catalog).unwrap(),
+            catalog,
+            rules: Vec::new(),
+            probes: crate::clash_api::probes::ProbeState::new(resolver, Vec::new()),
+        };
+        let chain = &group.chains[0];
+        assert_eq!(chain.select_indices(true).unwrap(), [0]);
+        let nodes = crate::clash_api::dto::proxies(&generation);
+        assert_eq!(chain.select_indices(true).unwrap(), [0]);
+        assert_eq!(nodes["proxies"]["auto"]["udpNow"], "deep-0");
+    }
+
+    #[test]
     fn unselected_large_pools_keep_constant_time_round_robin() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let chain = ClientProxyChain::new(
@@ -723,7 +1219,7 @@ mod carrier_tests {
 - client_group: weighted
   client_proxies: [leaves, leaves, direct]
 - client_group: choose
-  strategy: selector
+  type: selector
   client_proxies: [weighted, direct]
 - address: 127.0.0.1:1080
   protocol: {type: socks}
@@ -763,7 +1259,7 @@ mod carrier_tests {
     fn udp_selection_rejects_ineligible_member_without_falling_back() {
         let yaml = "
 - client_group: leaves
-  strategy: selector
+  type: selector
   default: http
   client_proxies:
     - name: http
@@ -1105,7 +1601,7 @@ impl std::fmt::Debug for ClientChainGroup {
 }
 
 impl ClientChainGroup {
-    fn tracking(&self) -> Option<(&RuleDescription, &FlowContext)> {
+    pub(crate) fn tracking(&self) -> Option<(&RuleDescription, &FlowContext)> {
         let description = self.description.as_deref()?;
         Some((description, description.context.as_deref()?))
     }
@@ -1160,10 +1656,23 @@ impl ClientChainGroup {
         let Some((description, context)) = self.tracking() else {
             return chain.connect_tcp(remote_location, resolver).await;
         };
+        if let Some(notes) = &info.notes {
+            notes.event(Phase::Dial, format_args!("begin outbound setup"));
+        }
+        let resolver = connection_notes::resolver(resolver, info.notes.as_ref(), Phase::Dial);
         let mut path = Vec::new();
         let mut result = chain
-            .connect_tcp_observed(remote_location.clone(), resolver, Some(&mut path))
+            .connect_tcp_observed(remote_location.clone(), &resolver, Some(&mut path))
             .await?;
+        if let Some(notes) = &info.notes {
+            notes.event(
+                Phase::Setup,
+                format_args!(
+                    "outbound ready; peer {:?}",
+                    result.client_stream.peer_addr()
+                ),
+            );
+        }
         let guard = register_flow(description, context, "tcp", &remote_location, path, info);
         guard
             .entry
@@ -1195,10 +1704,17 @@ impl ClientChainGroup {
         let Some((description, context)) = self.tracking() else {
             return chain.connect_udp_bidirectional(resolver, target).await;
         };
+        if let Some(notes) = &info.notes {
+            notes.event(Phase::Dial, format_args!("begin outbound setup"));
+        }
+        let resolver = connection_notes::resolver(resolver, info.notes.as_ref(), Phase::Dial);
         let mut path = Vec::new();
         let stream = chain
-            .connect_udp_observed(resolver, target.clone(), Some(&mut path))
+            .connect_udp_observed(&resolver, target.clone(), Some(&mut path))
             .await?;
+        if let Some(notes) = &info.notes {
+            notes.event(Phase::Setup, format_args!("outbound ready"));
+        }
         let guard = register_flow(description, context, "udp", &target, path, info);
         Ok(Box::new(
             crate::control::tracked_stream::TrackedMessageStream::new(stream, guard),
@@ -1226,6 +1742,7 @@ impl ClientChainGroup {
         let index = self.next_udp_index.fetch_add(1, Ordering::Relaxed) as usize;
         let chain = &self.chains[index % self.chains.len()];
         let indices = chain.select_indices(true)?;
+        chain.touch_automatic(&indices, false);
         let InitialHopEntry::Direct(socket) = chain.initial_hop[indices[0]].as_ref() else {
             unreachable!("direct-only chain checked above")
         };
